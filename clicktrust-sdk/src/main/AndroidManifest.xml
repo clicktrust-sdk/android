@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ClickTrust Android SDK manifest.
+
+  We declare ONLY the permissions that survive privacy review on Google
+  Play without an extra sensitive-permissions declaration:
+    - INTERNET so the collect + session-event clients can reach our
+      backend (mandatory).
+    - ACCESS_NETWORK_STATE so NetworkSignals can report whether the
+      device is on Wi-Fi vs cellular vs offline. This drives the
+      "deviceFarm + cellular" trap and the IP-distrust scoring.
+
+  Notably absent (and intentional):
+    - READ_PHONE_STATE — we never read IMEI / subscriber id.
+    - ACCESS_FINE_LOCATION — IP-derived geo is enough; on-device GPS
+      requires runtime prompts the consumer would have to wire.
+    - AD_ID — see PrivacySignals.kt for the manifest-merge guidance we
+      give consumers; we do NOT request it on their behalf.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+</manifest>
