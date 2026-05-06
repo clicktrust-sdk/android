@@ -46,7 +46,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.bdeeps:ClickTrust-Sentinel:1.0.0")
+    implementation("com.github.clicktrust-sdk:android:1.0.0")
 }
 ```
 

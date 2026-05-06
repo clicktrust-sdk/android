@@ -89,7 +89,7 @@ publishing {
             pom {
                 name.set("ClickTrust Android SDK")
                 description.set("Native Android SDK for ClickTrust fraud detection — same signal collection + verdict + captcha protocol as the JS snippet and the iOS SDK.")
-                url.set("https://github.com/bdeeps/ClickTrust-Sentinel")
+                url.set("https://github.com/clicktrust-sdk/android")
                 licenses {
                     license {
                         name.set("Apache License 2.0")
