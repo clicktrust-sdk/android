@@ -10,13 +10,16 @@ import java.util.concurrent.Executors
 /**
  * Batches session-replay events into a single POST.
  *
- * Wire shape (matches iOS exactly so the server's session-event
- * pipeline doesn't need to branch on platform):
+ * Wire shape (matches iOS for `bundleId` byte-for-byte; the extra
+ * `packageName` is the platform-natural alias so the server's
+ * Android identity check works without depending on the legacy
+ * iOS-derived key name):
  *
  *     {
  *       "sessionId": "<uuid>",
  *       "tid": "<tracking id>",
  *       "bundleId": "<bundle / package>",
+ *       "packageName": "<bundle / package>",     // same value as bundleId
  *       "platform": "android",
  *       "events": [ <SessionEvent JSON>, ... ]
  *     }
@@ -46,7 +49,11 @@ internal class SessionEventClient(private val config: ClickTrustConfig) {
         val root = JSONObject().apply {
             put("sessionId", sessionId)
             put("tid", config.trackingId)
+            // Emit both keys — server's Android identity check reads
+            // `packageName`, but `bundleId` stays for parity with iOS
+            // and the JS snippet. Same value, two keys.
             put("bundleId", bundleId)
+            put("packageName", bundleId)
             put("platform", "android")
             put("events", arr)
         }

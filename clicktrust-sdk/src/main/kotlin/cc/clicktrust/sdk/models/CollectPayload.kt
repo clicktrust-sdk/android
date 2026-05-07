@@ -77,7 +77,13 @@ internal data class CollectPayload(
         // order keeps the bytes deterministic across builds.
         root.put("tid", tid)
         root.put("platform", platform)
+        // Emit BOTH `bundleId` (kept for byte-for-byte symmetry with
+        // the iOS SDK and the JS snippet) AND `packageName` (the
+        // natural Android name; what the server's identity check
+        // reads for Android accounts). Same value, two keys —
+        // tolerant of either side renaming first.
         root.put("bundleId", bundleId)
+        root.put("packageName", bundleId)
         root.put("appVersion", appVersion ?: JSONObject.NULL)
         root.put("osVersion", osVersion)
         root.put("deviceModel", deviceModel)
