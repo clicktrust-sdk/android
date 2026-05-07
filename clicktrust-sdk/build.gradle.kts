@@ -79,7 +79,7 @@ publishing {
         register<MavenPublication>("release") {
             groupId = "cc.clicktrust"
             artifactId = "clicktrust-sdk"
-            version = "1.0.0"
+            version = "1.1.0"
             // Wire the AAR component once Android Gradle finishes
             // configuration. `release` is created lazily by the Android
             // plugin so we attach it inside afterEvaluate.

@@ -28,7 +28,7 @@ configuration works the same regardless of where the click originates.
 ```kotlin
 // app/build.gradle.kts
 dependencies {
-    implementation("cc.clicktrust:clicktrust-sdk:1.0.0")
+    implementation("cc.clicktrust:clicktrust-sdk:1.1.0")
 }
 ```
 
@@ -46,18 +46,18 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.clicktrust-sdk:android:1.0.0")
+    implementation("com.github.clicktrust-sdk:android:1.1.0")
 }
 ```
 
 ### AAR drop-in
 
-Download `clicktrust-sdk-1.0.0.aar` from the GitHub release and copy
+Download `clicktrust-sdk-1.1.0.aar` from the GitHub release and copy
 into `app/libs`, then:
 
 ```kotlin
 dependencies {
-    implementation(files("libs/clicktrust-sdk-1.0.0.aar"))
+    implementation(files("libs/clicktrust-sdk-1.1.0.aar"))
 }
 ```
 
@@ -136,6 +136,85 @@ ClickTrust.maskField(myCreditCardEditText)
 // payment button, etc. Throttled to one collect per 5s.
 ClickTrust.collectNow()
 ```
+
+## App-level events (`trackEvent`)
+
+App events are funnel-level user actions captured in addition to
+fraud-detection telemetry — install, signup, purchase, level_complete,
+and any custom event your app cares about. Each event is linked
+server-side to the most recent fraud-scored click for the same device,
+so the dashboard can answer "did this $99 purchase come from a CLEAN
+session?".
+
+The taxonomy mirrors AppsFlyer / Adjust / Firebase Analytics — use
+the constants in `AppEvent.Names` whenever you can so events roll up
+into the pre-built dashboards. Custom names still record but are
+categorised as `"custom"`.
+
+### Auto-events (no code required)
+
+`ClickTrust.configure(...)` automatically fires these four events:
+
+- `install` — once per device, on the first SDK launch after install
+- `first_open` — same trigger as install (kept distinct for AppsFlyer
+  parity — some networks subscribe to one but not the other)
+- `session_start` — on every cold-start, and on every foreground
+  re-entry after a 30-second idle window
+- `update` — when the SDK detects a version-name change since the
+  last launch
+
+To disable auto-events (e.g. you have a homegrown analytics layer):
+
+```kotlin
+ClickTrust.configure(application = this, config = cfg, autoEvents = false)
+```
+
+### Manual events
+
+```kotlin
+import cc.clicktrust.sdk.ClickTrust
+import cc.clicktrust.sdk.models.AppEvent
+
+// Standard event with revenue
+ClickTrust.trackEvent(
+    name = AppEvent.PURCHASE,
+    amount = 9.99,
+    currency = "USD",            // optional; account default is used otherwise
+    contentId = "sku_42",
+    contentType = "product",
+    quantity = 1,
+    properties = mapOf("orderId" to "ord_123", "promo" to "WELCOME10"),
+)
+
+// Engagement event
+ClickTrust.trackEvent(name = AppEvent.LOGIN, properties = mapOf("method" to "google"))
+
+// Custom event (not in the standard catalog — still recorded)
+ClickTrust.trackEvent(name = "promo_redeem_v3", properties = mapOf("variant" to "B"))
+```
+
+### Idempotency
+
+Each call gets an auto-generated `externalId` (UUID) so a network
+retry never produces a duplicate. Pass your own when you want to
+deduplicate against a server-side order id:
+
+```kotlin
+ClickTrust.trackEvent(
+    name = AppEvent.PURCHASE,
+    amount = 9.99,
+    externalId = "ord_${order.id}",   // server upserts on (account_id, external_id)
+)
+```
+
+### Standard event catalog
+
+Lifecycle (auto): `install`, `first_open`, `session_start`, `update`
+Engagement: `login`, `signup`, `tutorial_complete`, `search`, `share`, `rate`
+Ecommerce: `view_item`, `add_to_cart`, `add_to_wishlist`, `begin_checkout`, `add_payment_info`, `purchase`, `refund`, `subscribe`, `trial_start`
+Ads: `ad_view`, `ad_click`, `ad_reward`
+Gaming: `level_start`, `level_complete`, `achievement_unlocked`, `spend_credits`
+Content: `content_view`, `content_complete`
 
 ## Repackaged-APK detection
 

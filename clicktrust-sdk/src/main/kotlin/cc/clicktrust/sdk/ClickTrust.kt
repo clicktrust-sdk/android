@@ -11,6 +11,7 @@ import cc.clicktrust.sdk.block.CaptchaOverlay
 import cc.clicktrust.sdk.internal.LifecycleTracker
 import cc.clicktrust.sdk.internal.Logger
 import cc.clicktrust.sdk.models.AntiDetectInfo
+import cc.clicktrust.sdk.models.AppEvent
 import cc.clicktrust.sdk.models.BehavioralInfo
 import cc.clicktrust.sdk.models.ChallengeProof
 import cc.clicktrust.sdk.models.CollectPayload
@@ -25,9 +26,12 @@ import cc.clicktrust.sdk.signals.NetworkSignals
 import cc.clicktrust.sdk.signals.PrivacySignals
 import cc.clicktrust.sdk.signals.SecuritySignals
 import cc.clicktrust.sdk.signals.ViewabilitySignals
+import cc.clicktrust.sdk.transport.AppEventClient
 import cc.clicktrust.sdk.transport.CollectClient
 import cc.clicktrust.sdk.transport.SessionEventClient
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Public façade for the ClickTrust Android SDK.
@@ -62,21 +66,38 @@ import java.util.concurrent.atomic.AtomicLong
  */
 public object ClickTrust {
 
-    public const val VERSION: String = "1.0.0"
+    public const val VERSION: String = "1.1.0"
 
     @Volatile private var appContext: Context? = null
     @Volatile private var config: ClickTrustConfig? = null
     @Volatile private var collectClient: CollectClient? = null
     @Volatile private var sessionClient: SessionEventClient? = null
+    @Volatile private var appEventClient: AppEventClient? = null
     @Volatile private var recorder: SessionRecorder? = null
     @Volatile private var gestureCapture: GestureCapture? = null
     @Volatile private var verdictHandler: ((Verdict) -> Unit)? = null
     @Volatile private var expectedSigningSha256: String? = null
     @Volatile private var lastChallengeProof: ChallengeProof? = null
+    @Volatile private var sessionId: String? = null
+    @Volatile private var autoEventsEnabled: Boolean = true
+    private val sessionStartedAt = AtomicLong(0L)
+    private val lastForegroundAt = AtomicLong(0L)
+    private val deviceIdHashRef = AtomicReference<String?>(null)
+    private val sdkPreferences get() = appContext?.getSharedPreferences("clicktrust_sdk_state", Context.MODE_PRIVATE)
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lastCollectAt = AtomicLong(0L)
     private const val COLLECT_MIN_INTERVAL_MS: Long = 5_000
+
+    /**
+     * Idle window after which the next foreground transition fires a
+     * fresh `session_start` auto-event. Matches AppsFlyer's default.
+     */
+    private const val SESSION_IDLE_THRESHOLD_MS: Long = 30_000
+
+    private const val PREF_INSTALL_VERSION = "install_version"
+    private const val PREF_LAST_VERSION = "last_version"
+    private const val PREF_INSTALL_FIRED = "install_fired"
 
     // ── Configuration ────────────────────────────────────────────
 
@@ -90,11 +111,21 @@ public object ClickTrust {
      * bundle detector. Pass the lowercase hex SHA-256 of your
      * production signing cert (`apksigner verify --print-certs`).
      */
+    /**
+     * Validates [config] and starts collect / session-event / lifecycle
+     * / gesture pipelines. [autoEvents] (default `true`) enables
+     * AppsFlyer-style auto firing of `install`, `first_open`,
+     * `session_start`, and `update` so a partner who only calls
+     * [configure] already gets install metrics with zero extra code.
+     * Set false if you have a homegrown analytics layer and want full
+     * control.
+     */
     @AnyThread
     public fun configure(
         application: Application,
         config: ClickTrustConfig,
         expectedSigningCertSha256: String? = null,
+        autoEvents: Boolean = true,
     ) {
         val validated = config.validate()
         synchronized(this) {
@@ -102,10 +133,14 @@ public object ClickTrust {
             this.appContext = application.applicationContext
             this.config = validated
             this.expectedSigningSha256 = expectedSigningCertSha256
+            this.autoEventsEnabled = autoEvents
+            this.sessionId = UUID.randomUUID().toString()
+            this.sessionStartedAt.set(System.currentTimeMillis())
             Logger.debugEnabled = validated.debugLogging
 
             val collect = CollectClient(validated)
             val session = SessionEventClient(validated)
+            val appEv = AppEventClient(validated)
             val rec = SessionRecorder(
                 config = validated,
                 client = session,
@@ -115,13 +150,21 @@ public object ClickTrust {
 
             this.collectClient = collect
             this.sessionClient = session
+            this.appEventClient = appEv
             this.recorder = rec
             this.gestureCapture = gestures
 
             LifecycleTracker.register(application)
             LifecycleTracker.configureCallbacks(
-                onForeground = { internalCollect("foreground") },
-                onBackground = { rec.flushNow() },
+                onForeground = {
+                    internalCollect("foreground")
+                    onForegroundForEvents()
+                },
+                onBackground = {
+                    rec.flushNow()
+                    appEv.flushNow()
+                    lastForegroundAt.set(System.currentTimeMillis())
+                },
             )
             gestures.attach(application)
             rec.start()
@@ -130,6 +173,11 @@ public object ClickTrust {
             // is in hand by the time the user lands on the home
             // screen.
             internalCollect("cold_start")
+
+            // Auto-events: install / first_open (once per install),
+            // update (once per detected version change), session_start
+            // (every fresh session). Cheap and deterministic.
+            if (autoEvents) fireLifecycleAutoEvents(application)
         }
     }
 
@@ -169,6 +217,67 @@ public object ClickTrust {
     }
 
     /**
+     * Track an app-level named event (purchase, signup, level_complete, …).
+     *
+     * The simplest call mirrors AppsFlyer's API:
+     * ```kotlin
+     * ClickTrust.trackEvent(AppEvent.PURCHASE, mapOf("amount" to 99.99))
+     * ```
+     *
+     * Standard event names live as constants on [AppEvent.Names] —
+     * use them whenever you can so the server's pre-built dashboards
+     * (purchase funnel, ad-funnel, signup-to-purchase) can group your
+     * events. Custom names still record; they're just categorised as
+     * `"custom"` and won't auto-roll-up.
+     *
+     * Revenue defaults: passing `amount` without `currency` lets the
+     * server fall back to your account's default currency (USD unless
+     * configured otherwise). Pass `currency` explicitly when you have
+     * multi-currency reporting.
+     *
+     * Idempotency: pass `externalId` to make retries safe — the
+     * server upserts on `(account_id, external_id)`. When omitted
+     * the SDK auto-generates a UUID per call so each successful POST
+     * counts exactly once.
+     */
+    @AnyThread
+    public fun trackEvent(
+        name: String,
+        properties: Map<String, Any?> = emptyMap(),
+        amount: Double? = null,
+        currency: String? = null,
+        contentId: String? = null,
+        contentType: String? = null,
+        quantity: Int? = null,
+        externalId: String? = null,
+    ) {
+        enqueueEvent(
+            AppEvent(
+                name = name,
+                ts = System.currentTimeMillis(),
+                amount = amount,
+                currency = currency,
+                contentId = contentId,
+                contentType = contentType,
+                quantity = quantity,
+                properties = properties,
+                externalId = externalId ?: UUID.randomUUID().toString(),
+                source = "sdk",
+                sessionId = sessionId,
+            ),
+        )
+    }
+
+    /** Convenience overload — partner passes a fully-built [AppEvent]. */
+    @AnyThread
+    public fun trackEvent(event: AppEvent) {
+        enqueueEvent(event.copy(
+            externalId = event.externalId ?: UUID.randomUUID().toString(),
+            sessionId = event.sessionId ?: sessionId,
+        ))
+    }
+
+    /**
      * Hint that a particular view holds sensitive content. Currently a
      * no-op for the SDK's own collect (we don't capture screenshots),
      * but the value is stamped onto the View's `contentDescription`
@@ -205,16 +314,118 @@ public object ClickTrust {
         recorder?.stop()
         collectClient?.shutdown()
         sessionClient?.shutdown()
+        appEventClient?.shutdown()
         LifecycleTracker.configureCallbacks(null, null)
         recorder = null
         collectClient = null
         sessionClient = null
+        appEventClient = null
         gestureCapture = null
         config = null
         appContext = null
         verdictHandler = null
         expectedSigningSha256 = null
         lastChallengeProof = null
+        sessionId = null
+        autoEventsEnabled = true
+        sessionStartedAt.set(0L)
+        lastForegroundAt.set(0L)
+        deviceIdHashRef.set(null)
+    }
+
+    // ── App events helpers ───────────────────────────────────────
+
+    private fun enqueueEvent(event: AppEvent) {
+        val ctx = appContext ?: return
+        val client = appEventClient ?: return
+        // Stamp identity context onto every event so the batch
+        // poster can hoist them to top-level without having to peek
+        // into Application again. We resolve deviceIdHash lazily and
+        // cache it for the lifetime of the SDK process.
+        val deviceIdHash = deviceIdHashRef.get() ?: run {
+            val cfg = config
+            val resolved = if (cfg != null) DeviceSignals.snapshot(ctx, cfg.trackingId).deviceIdHash else null
+            deviceIdHashRef.set(resolved)
+            resolved
+        }
+        val packageManager = runCatching { ctx.packageManager?.getPackageInfo(ctx.packageName, 0) }.getOrNull()
+        val appVersion = packageManager?.versionName
+        val osVersion = android.os.Build.VERSION.RELEASE
+        val deviceModel = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+
+        val stamped = event.copy(
+            deviceIdHash = event.deviceIdHash ?: deviceIdHash,
+            bundleId = event.bundleId ?: ctx.packageName,
+            appVersion = event.appVersion ?: appVersion,
+            osVersion = event.osVersion ?: osVersion,
+            deviceModel = event.deviceModel ?: deviceModel,
+            sessionId = event.sessionId ?: sessionId,
+        )
+        client.enqueue(stamped)
+    }
+
+    private fun fireLifecycleAutoEvents(application: Application) {
+        try {
+            val prefs = sdkPreferences ?: return
+            val pkg = application.packageName
+            val pm = runCatching { application.packageManager.getPackageInfo(pkg, 0) }.getOrNull()
+            val currentVersion = pm?.versionName ?: "unknown"
+
+            val installFired = prefs.getBoolean(PREF_INSTALL_FIRED, false)
+            if (!installFired) {
+                // First-ever launch on this device. AppsFlyer fires both
+                // `install` (one-time) AND `first_open` (one-time)
+                // because some attribution networks subscribe to one but
+                // not the other. We do the same.
+                enqueueAutoEvent(AppEvent.INSTALL)
+                enqueueAutoEvent(AppEvent.FIRST_OPEN)
+                prefs.edit()
+                    .putBoolean(PREF_INSTALL_FIRED, true)
+                    .putString(PREF_INSTALL_VERSION, currentVersion)
+                    .putString(PREF_LAST_VERSION, currentVersion)
+                    .apply()
+            } else {
+                val lastVersion = prefs.getString(PREF_LAST_VERSION, null)
+                if (lastVersion != null && lastVersion != currentVersion) {
+                    enqueueAutoEvent(
+                        AppEvent.UPDATE,
+                        properties = mapOf("from" to lastVersion, "to" to currentVersion),
+                    )
+                }
+                prefs.edit().putString(PREF_LAST_VERSION, currentVersion).apply()
+            }
+            // session_start fires every time configure() runs (i.e. every
+            // process launch). Foreground re-entry within 30s is treated
+            // as the same session — see onForegroundForEvents.
+            enqueueAutoEvent(AppEvent.SESSION_START)
+        } catch (t: Throwable) {
+            Logger.w("Auto-event fire failed", t)
+        }
+    }
+
+    private fun onForegroundForEvents() {
+        if (!autoEventsEnabled) return
+        val now = System.currentTimeMillis()
+        val last = lastForegroundAt.getAndSet(now)
+        // Fresh session if the app was backgrounded for >30s.
+        if (last > 0 && now - last > SESSION_IDLE_THRESHOLD_MS) {
+            sessionId = UUID.randomUUID().toString()
+            sessionStartedAt.set(now)
+            enqueueAutoEvent(AppEvent.SESSION_START)
+        }
+    }
+
+    private fun enqueueAutoEvent(name: String, properties: Map<String, Any?> = emptyMap()) {
+        enqueueEvent(
+            AppEvent(
+                name = name,
+                ts = System.currentTimeMillis(),
+                properties = properties,
+                externalId = UUID.randomUUID().toString(),
+                source = "auto",
+                sessionId = sessionId,
+            ),
+        )
     }
 
     private fun internalCollect(reason: String) {
